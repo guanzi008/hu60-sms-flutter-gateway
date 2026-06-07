@@ -57,13 +57,23 @@ class MainActivity : FlutterActivity() {
                     }
                     "setKeepAliveLock" -> {
                         val enabled = call.argument<Boolean>("enabled") ?: false
-                        setKeepAliveLock(enabled)
-                        result.success(true)
+                        try {
+                            setKeepAliveLock(enabled)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            Log.e("Hu60SmsGateway", "setKeepAliveLock failed", e)
+                            result.error("KEEP_ALIVE_ERROR", e.message, null)
+                        }
                     }
                     "setForegroundService" -> {
                         val enabled = call.argument<Boolean>("enabled") ?: false
-                        setForegroundService(enabled)
-                        result.success(true)
+                        try {
+                            setForegroundService(enabled)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            Log.e("Hu60SmsGateway", "setForegroundService failed", e)
+                            result.error("FOREGROUND_SERVICE_ERROR", e.message, null)
+                        }
                     }
                     else -> result.notImplemented()
                 }
