@@ -2,11 +2,18 @@ package com.hu60.smsgateway
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.content.Intent
+import android.os.Environment
 import android.os.Build
+import android.os.PowerManager
+import android.telephony.SmsManager
 import android.telephony.SubscriptionInfo
 import android.telephony.SubscriptionManager
-import android.telephony.SmsManager
 import android.util.Log
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
@@ -18,6 +25,7 @@ class MainActivity : FlutterActivity() {
     private val channelName = "hu60.sms_gateway/sms"
     private val requestPermissionCode = 1901
     private var permissionResult: MethodChannel.Result? = null
+    private var keepAliveLock: PowerManager.WakeLock? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -41,6 +49,21 @@ class MainActivity : FlutterActivity() {
                     }
                     "requestSmsPermissions" -> {
                         requestPermissionsCompat(result)
+                    }
+                    "exportLogsToFile" -> {
+                        val type = call.argument<String>("type")
+                        val content = call.argument<String>("content") ?: ""
+                        exportLogsToFile(type, content, result)
+                    }
+                    "setKeepAliveLock" -> {
+                        val enabled = call.argument<Boolean>("enabled") ?: false
+                        setKeepAliveLock(enabled)
+                        result.success(true)
+                    }
+                    "setForegroundService" -> {
+                        val enabled = call.argument<Boolean>("enabled") ?: false
+                        setForegroundService(enabled)
+                        result.success(true)
                     }
                     else -> result.notImplemented()
                 }
@@ -82,6 +105,72 @@ class MainActivity : FlutterActivity() {
         } else {
             permissionResult?.success(permissionStatusMap())
             permissionResult = null
+        }
+    }
+
+    private fun exportLogsToFile(
+        type: String?,
+        content: String,
+        result: MethodChannel.Result,
+    ) {
+        if (content.isBlank()) {
+            result.success("")
+            return
+        }
+
+        try {
+            val safeType = when (type) {
+                "request" -> "request"
+                "runtime" -> "runtime"
+                else -> "all"
+            }
+
+            val base = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+            } else {
+                filesDir
+            } ?: filesDir
+
+            val dir = File(base, "Hu60SmsGateway")
+            if (!dir.exists()) {
+                dir.mkdirs()
+            }
+            val sdf = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault())
+            val file = File(dir, "${safeType}_logs_${sdf.format(Date())}.txt")
+            file.writeText(content)
+            result.success(file.absolutePath)
+        } catch (e: Exception) {
+            result.error("LOG_EXPORT_ERROR", e.message, null)
+        }
+    }
+
+    private fun setKeepAliveLock(enabled: Boolean) {
+        if (!enabled) {
+            keepAliveLock?.takeIf { it.isHeld }?.release()
+            keepAliveLock = null
+            return
+        }
+
+        if (keepAliveLock?.isHeld == true) {
+            return
+        }
+
+        val powerManager = getSystemService(PowerManager::class.java) ?: return
+        keepAliveLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "hu60sms:SmsGateway")
+        keepAliveLock?.setReferenceCounted(false)
+        keepAliveLock?.acquire()
+    }
+
+    private fun setForegroundService(enabled: Boolean) {
+        val intent = Intent(this, SmsGatewayForegroundService::class.java)
+        if (!enabled) {
+            stopService(intent)
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
         }
     }
 
