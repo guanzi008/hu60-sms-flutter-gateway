@@ -38,22 +38,27 @@ class GatewayPage extends StatefulWidget {
   State<GatewayPage> createState() => _GatewayPageState();
 }
 
-class _GatewayPageState extends State<GatewayPage> {
+class _GatewayPageState extends State<GatewayPage> with WidgetsBindingObserver {
   late final TextEditingController _apiKeyController;
   late final TextEditingController _portController;
   late final TextEditingController _slotController;
   late final TextEditingController _rateLimitSecController;
   late final TextEditingController _rateLimitDailyController;
   late final TextEditingController _globalLimitController;
+  late final TextEditingController _ipWhitelistController;
   late final TextEditingController _testMobileController;
   late final TextEditingController _testTextController;
 
   late GatewayConfig _editing;
+  bool _ipWhitelistEnabled = false;
+  bool _autoStartEnabled = false;
   bool _ready = false;
   bool _sendingTest = false;
   bool _permissionBusy = false;
   SmsPermissionState _permissionState = const SmsPermissionState.unknown();
   String _localIp = '127.0.0.1';
+  bool _appInForeground = true;
+  bool _recovering = false;
 
   @override
   void initState() {
@@ -66,9 +71,13 @@ class _GatewayPageState extends State<GatewayPage> {
     _rateLimitSecController = TextEditingController(text: cfg.rateLimitSec.toString());
     _rateLimitDailyController = TextEditingController(text: cfg.rateLimitDaily.toString());
     _globalLimitController = TextEditingController(text: cfg.globalDailyLimit.toString());
+    _ipWhitelistController = TextEditingController(text: cfg.ipWhitelist);
     _testMobileController = TextEditingController();
     _testTextController = TextEditingController();
+    _ipWhitelistEnabled = cfg.ipWhitelistEnabled;
+    _autoStartEnabled = cfg.autoStartEnabled;
 
+    WidgetsBinding.instance.addObserver(this);
     widget.service.addListener(_onServiceUpdated);
     _initialize();
   }
@@ -82,9 +91,48 @@ class _GatewayPageState extends State<GatewayPage> {
     _rateLimitSecController.dispose();
     _rateLimitDailyController.dispose();
     _globalLimitController.dispose();
+    _ipWhitelistController.dispose();
     _testMobileController.dispose();
     _testTextController.dispose();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    final foreground = state == AppLifecycleState.resumed;
+    if (mounted) {
+      setState(() {
+        _appInForeground = foreground;
+      });
+    }
+    if (foreground) {
+      _onAppResumed();
+    } else if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive || state == AppLifecycleState.detached) {
+      widget.service.appendSystemLog('应用进入后台，服务维持中');
+    }
+  }
+
+  Future<void> _onAppResumed() async {
+    if (!_appInForeground) return;
+    if (!widget.service.shouldKeepServerAlive) return;
+    if (widget.service.running) return;
+    setState(() {
+      _recovering = true;
+    });
+    try {
+      final ok = await widget.service.recoverServerIfNeeded();
+      if (ok) {
+        _notify('检测到服务未运行，已自动恢复');
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _recovering = false;
+        });
+      }
+    }
   }
 
   Future<void> _initialize() async {
@@ -92,10 +140,33 @@ class _GatewayPageState extends State<GatewayPage> {
     _syncFormFromConfig();
     await _loadLocalIp();
     await _reloadPermissions(showSnackBar: false);
+    await _autoStartIfConfigured();
     if (mounted) {
       setState(() {
         _ready = true;
       });
+    }
+  }
+
+  Future<void> _autoStartIfConfigured() async {
+    if (!_autoStartEnabled) return;
+    if (!_permissionState.allGranted) {
+      await _reloadPermissions(showSnackBar: false);
+      if (!_permissionState.allGranted) {
+        widget.service.appendSystemLog('已启用开机自启，但缺少短信/电话权限，跳过自动启动');
+        return;
+      }
+    }
+    if (widget.service.config.apiKey.trim().isEmpty) {
+      widget.service.appendSystemLog('已启用开机自启但 API Key 为空，跳过自动启动');
+      return;
+    }
+    if (widget.service.running) return;
+    try {
+      await widget.service.start();
+      widget.service.appendSystemLog('开机自启动服务已恢复');
+    } catch (e) {
+      widget.service.appendSystemLog('开机自启动服务失败: $e');
     }
   }
 
@@ -108,6 +179,9 @@ class _GatewayPageState extends State<GatewayPage> {
     _rateLimitSecController.text = cfg.rateLimitSec.toString();
     _rateLimitDailyController.text = cfg.rateLimitDaily.toString();
     _globalLimitController.text = cfg.globalDailyLimit.toString();
+    _ipWhitelistEnabled = cfg.ipWhitelistEnabled;
+    _autoStartEnabled = cfg.autoStartEnabled;
+    _ipWhitelistController.text = cfg.ipWhitelist;
   }
 
   void _onServiceUpdated() {
@@ -167,6 +241,9 @@ class _GatewayPageState extends State<GatewayPage> {
       rateLimitSec: int.tryParse(_rateLimitSecController.text.trim()) ?? 30,
       rateLimitDaily: int.tryParse(_rateLimitDailyController.text.trim()) ?? 10,
       globalDailyLimit: int.tryParse(_globalLimitController.text.trim()) ?? 100,
+      ipWhitelistEnabled: _ipWhitelistEnabled,
+      ipWhitelist: _ipWhitelistController.text.trim(),
+      autoStartEnabled: _autoStartEnabled,
     );
     await widget.service.saveConfig(next);
     _editing = next;
@@ -275,6 +352,24 @@ class _GatewayPageState extends State<GatewayPage> {
     _notify('请求日志已复制到剪贴板');
   }
 
+  Future<void> _exportRuntimeLogs() async {
+    try {
+      final path = await widget.service.exportRuntimeLogsToFile();
+      _notify('运行日志已导出：$path');
+    } catch (e) {
+      _notify('导出运行日志失败：$e');
+    }
+  }
+
+  Future<void> _exportRequestLogs() async {
+    try {
+      final path = await widget.service.exportRequestLogsToFile();
+      _notify('请求日志已导出：$path');
+    } catch (e) {
+      _notify('导出请求日志失败：$e');
+    }
+  }
+
   Future<void> _clearRuntimeLogs() async {
     await widget.service.clearRuntimeLogs();
     _notify('运行日志已清空');
@@ -305,6 +400,7 @@ class _GatewayPageState extends State<GatewayPage> {
       body: ListView(
         padding: const EdgeInsets.fromLTRB(12, 12, 12, 16),
         children: [
+          _buildLifecycleCard(),
           _buildPermissionCard(),
           const SizedBox(height: 12),
           _buildConfigCard(),
@@ -383,6 +479,33 @@ class _GatewayPageState extends State<GatewayPage> {
     );
   }
 
+  Widget _buildLifecycleCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('运行与保活', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 8),
+            Text('应用状态：${_appInForeground ? '前台' : '后台'}'),
+            const SizedBox(height: 4),
+            Text('服务期望状态：${widget.service.shouldKeepServerAlive ? '保活中' : '手动控制'}'),
+            const SizedBox(height: 4),
+            Text('开机自启：${_autoStartEnabled ? '开启' : '关闭'}'),
+            const SizedBox(height: 4),
+            Text('恢复中：${_recovering ? '是' : '否'}'),
+            const SizedBox(height: 4),
+            const Text(
+              '说明：应用进入后台后，系统可能回收进程。回到前台时会尝试自动恢复服务。',
+              style: TextStyle(fontSize: 12, color: Colors.black54),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildConfigCard() {
     return Card(
       child: Padding(
@@ -443,6 +566,39 @@ class _GatewayPageState extends State<GatewayPage> {
                 ),
               ],
             ),
+            const SizedBox(height: 8),
+            SwitchListTile.adaptive(
+              value: _ipWhitelistEnabled,
+              onChanged: (value) {
+                setState(() {
+                  _ipWhitelistEnabled = value;
+                });
+              },
+              title: const Text('启用 IP 白名单'),
+              subtitle: const Text('关闭时允许任意 IP 调用 /sms'),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _ipWhitelistController,
+              maxLines: 3,
+              enabled: _ipWhitelistEnabled,
+              decoration: const InputDecoration(
+                labelText: '白名单（逐行或逗号分隔，支持 192.168.1.100, 10.0.0.0/8, 172.16.0.*）',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 8),
+            SwitchListTile.adaptive(
+              value: _autoStartEnabled,
+              onChanged: (value) {
+                setState(() {
+                  _autoStartEnabled = value;
+                });
+              },
+              title: const Text('开机自启'),
+              subtitle: const Text('应用启动后尝试自动启动服务（需权限且 API Key 已配置）'),
+            ),
+            const SizedBox(height: 8),
             const SizedBox(height: 8),
             FilledButton(
               onPressed: _applyConfig,
@@ -518,7 +674,11 @@ class _GatewayPageState extends State<GatewayPage> {
             Text('拒绝-参数错误：${stats.badRequestCount}'),
             Text('拒绝-频率限制：${stats.rateLimitCount}'),
             const SizedBox(height: 4),
-            Text('路径错误：${stats.routeOrMethodRejectCount}', style: const TextStyle(color: Colors.black54)),
+            Text('拒绝-路径/方法错误：${stats.routeOrMethodRejectCount}', style: const TextStyle(color: Colors.black54)),
+            const SizedBox(height: 4),
+            Text('拒绝-IP 白名单：${stats.blockedByIpCount}', style: const TextStyle(color: Colors.black54)),
+            const SizedBox(height: 4),
+            Text('自动恢复失败：${stats.autoRecoverFailures}', style: const TextStyle(color: Colors.black54)),
           ],
         ),
       ),
@@ -575,6 +735,11 @@ class _GatewayPageState extends State<GatewayPage> {
                       icon: const Icon(Icons.copy_all),
                     ),
                     IconButton(
+                      onPressed: _exportRequestLogs,
+                      tooltip: '导出请求日志到文件',
+                      icon: const Icon(Icons.save_alt),
+                    ),
+                    IconButton(
                       onPressed: widget.service.requestLogs.isEmpty ? null : _clearRequestLogs,
                       tooltip: '清空请求日志',
                       icon: const Icon(Icons.delete_sweep),
@@ -608,6 +773,11 @@ class _GatewayPageState extends State<GatewayPage> {
                       onPressed: _copyRuntimeLogs,
                       tooltip: '复制运行日志',
                       icon: const Icon(Icons.copy_all),
+                    ),
+                    IconButton(
+                      onPressed: _exportRuntimeLogs,
+                      tooltip: '导出运行日志到文件',
+                      icon: const Icon(Icons.save_alt),
                     ),
                     IconButton(
                       onPressed: widget.service.logs.isEmpty ? null : _clearRuntimeLogs,
@@ -693,6 +863,9 @@ class GatewayConfig {
     required this.rateLimitSec,
     required this.rateLimitDaily,
     required this.globalDailyLimit,
+    required this.ipWhitelistEnabled,
+    required this.ipWhitelist,
+    required this.autoStartEnabled,
   });
 
   final String apiKey;
@@ -701,6 +874,9 @@ class GatewayConfig {
   final int rateLimitSec;
   final int rateLimitDaily;
   final int globalDailyLimit;
+  final bool ipWhitelistEnabled;
+  final String ipWhitelist;
+  final bool autoStartEnabled;
 
   static GatewayConfig defaults() => GatewayConfig(
         apiKey: '',
@@ -709,6 +885,9 @@ class GatewayConfig {
         rateLimitSec: 30,
         rateLimitDaily: 10,
         globalDailyLimit: 100,
+        ipWhitelistEnabled: false,
+        ipWhitelist: '',
+        autoStartEnabled: false,
       );
 
   Map<String, Object> toMap() => {
@@ -718,6 +897,9 @@ class GatewayConfig {
         'rateLimitSec': rateLimitSec,
         'rateLimitDaily': rateLimitDaily,
         'globalDailyLimit': globalDailyLimit,
+        'ipWhitelistEnabled': ipWhitelistEnabled,
+        'ipWhitelist': ipWhitelist,
+        'autoStartEnabled': autoStartEnabled,
       };
 
   factory GatewayConfig.fromMap(Map<String, dynamic> map) => GatewayConfig(
@@ -727,6 +909,9 @@ class GatewayConfig {
         rateLimitSec: int.tryParse(map['rateLimitSec']?.toString() ?? '') ?? 30,
         rateLimitDaily: int.tryParse(map['rateLimitDaily']?.toString() ?? '') ?? 10,
         globalDailyLimit: int.tryParse(map['globalDailyLimit']?.toString() ?? '') ?? 100,
+        ipWhitelistEnabled: map['ipWhitelistEnabled'] == true,
+        ipWhitelist: map['ipWhitelist']?.toString() ?? '',
+        autoStartEnabled: map['autoStartEnabled'] == true,
       );
 }
 
@@ -803,6 +988,7 @@ class SmsGatewayService extends ChangeNotifier {
   _RateState _rateState = _RateState.empty();
   _GatewayStats _stats = _GatewayStats.empty();
   HttpServer? _server;
+  bool _shouldKeepServerAlive = true;
   bool _initialized = false;
   bool _bootstrapping = false;
   late SharedPreferences _prefs;
@@ -813,6 +999,7 @@ class SmsGatewayService extends ChangeNotifier {
   String get requestLogText => _requestLogs.reversed.join('\n');
   _GatewayStats get stats => _stats.clone();
   bool get running => _server != null;
+  bool get shouldKeepServerAlive => _shouldKeepServerAlive;
 
   Future<void> initialize() async {
     if (_initialized) return;
@@ -855,6 +1042,66 @@ class SmsGatewayService extends ChangeNotifier {
   Future<bool> requestPermissions() async {
     final map = await _method.invokeMapMethod<String, dynamic>('requestSmsPermissions');
     return SmsPermissionState.fromMap(map).allGranted;
+  }
+
+  Future<void> _setKeepAliveLock(bool enabled) async {
+    try {
+      await _method.invokeMethod<void>('setKeepAliveLock', {'enabled': enabled});
+    } catch (_) {
+      // Older builds may not expose this method.
+    }
+  }
+
+  Future<void> _setForegroundService(bool enabled) async {
+    try {
+      await _method.invokeMethod<void>('setForegroundService', {'enabled': enabled});
+    } catch (_) {
+      // Older builds may not expose this method.
+    }
+  }
+
+  Future<String> exportRuntimeLogsToFile() async {
+    final path = await _method.invokeMethod<String>(
+      'exportLogsToFile',
+      {'type': 'runtime', 'content': runtimeLogText},
+    );
+    if (path == null) {
+      throw Exception('Native method returned null');
+    }
+    return path;
+  }
+
+  Future<String> exportRequestLogsToFile() async {
+    final path = await _method.invokeMethod<String>(
+      'exportLogsToFile',
+      {'type': 'request', 'content': requestLogText},
+    );
+    if (path == null) {
+      throw Exception('Native method returned null');
+    }
+    return path;
+  }
+
+  void appendSystemLog(String text) {
+    _appendLog(text);
+  }
+
+  Future<bool> recoverServerIfNeeded() async {
+    if (!_shouldKeepServerAlive) {
+      return false;
+    }
+    if (running) {
+      return true;
+    }
+    try {
+      await start();
+      _appendLog('已自动恢复服务');
+      return true;
+    } catch (e) {
+      _appendLog('自动恢复失败: $e');
+      _stats.autoRecoverFailures += 1;
+      return false;
+    }
   }
 
   Future<void> _loadConfigFromStorage() async {
@@ -946,9 +1193,12 @@ class SmsGatewayService extends ChangeNotifier {
 
   Future<void> start() async {
     if (_server != null) return;
+    _shouldKeepServerAlive = true;
     final port = int.tryParse(config.port) ?? 8080;
     final address = InternetAddress.anyIPv4;
     _server = await HttpServer.bind(address, port);
+    await _setKeepAliveLock(true);
+    await _setForegroundService(true);
     _appendLog('服务已启动: http://0.0.0.0:$port/sms');
     notifyListeners();
     _server!.listen((req) async {
@@ -961,7 +1211,10 @@ class SmsGatewayService extends ChangeNotifier {
   Future<void> stop() async {
     final server = _server;
     if (server == null) return;
+    _shouldKeepServerAlive = false;
     await server.close(force: true);
+    await _setForegroundService(false);
+    await _setKeepAliveLock(false);
     _server = null;
     _appendLog('服务已停止');
     notifyListeners();
@@ -999,6 +1252,21 @@ class SmsGatewayService extends ChangeNotifier {
         message: message,
       );
       await _jsonResponse(request.response, 405, 405, message);
+      return;
+    }
+
+    if (!_isIpAllowed(client)) {
+      const message = 'Request denied by IP allowlist';
+      _appendRequestLog(
+        clientIp: client,
+        method: method,
+        path: path,
+        status: 403,
+        code: 403,
+        message: message,
+        isIpBlocked: true,
+      );
+      await _jsonResponse(request.response, 403, 403, message);
       return;
     }
 
@@ -1110,6 +1378,83 @@ class SmsGatewayService extends ChangeNotifier {
     return request.connectionInfo?.remoteAddress.address ?? 'unknown';
   }
 
+  bool _isIpAllowed(String ip) {
+    if (!config.ipWhitelistEnabled) {
+      return true;
+    }
+
+    final rules = config.ipWhitelist
+        .split(RegExp(r'[\n,;]'))
+        .map((value) => value.trim())
+        .where((value) => value.isNotEmpty)
+        .toList();
+
+    if (rules.isEmpty) {
+      return true;
+    }
+    if (ip == 'unknown' || ip.isEmpty) {
+      return false;
+    }
+
+    for (final rule in rules) {
+      if (_matchIpRule(ip, rule)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _matchIpRule(String ip, String rawRule) {
+    final rule = rawRule.trim();
+    if (rule.contains('/')) {
+      return _matchCidr(ip, rule);
+    }
+    if (rule.contains('*')) {
+      final escaped = rule.split('*').map(RegExp.escape).join(r'\d{1,3}');
+      final regex = RegExp('^$escaped\$');
+      return regex.hasMatch(ip);
+    }
+    return ip == rule;
+  }
+
+  bool _matchCidr(String ip, String cidrRule) {
+    final parts = cidrRule.split('/');
+    if (parts.length != 2) {
+      return false;
+    }
+    final mask = int.tryParse(parts[1].trim());
+    if (mask == null || mask < 0 || mask > 32) {
+      return false;
+    }
+
+    final target = _ipv4ToInt(ip);
+    final base = _ipv4ToInt(parts[0].trim());
+    if (target == null || base == null) {
+      return false;
+    }
+    if (mask == 0) {
+      return true;
+    }
+    final maskValue = mask == 32 ? 0xFFFFFFFF : (~0 << (32 - mask)) & 0xFFFFFFFF;
+    return (target & maskValue) == (base & maskValue);
+  }
+
+  int? _ipv4ToInt(String ip) {
+    final parts = ip.split('.');
+    if (parts.length != 4) {
+      return null;
+    }
+    var out = 0;
+    for (final part in parts) {
+      final value = int.tryParse(part.trim());
+      if (value == null || value < 0 || value > 255) {
+        return null;
+      }
+      out = (out << 8) | value;
+    }
+    return out & 0xFFFFFFFF;
+  }
+
   String _parseRateLimitMessage(int sec, int total) {
     return '触发频率限制: 同一手机号今日已达 $total 条';
   }
@@ -1128,6 +1473,7 @@ class SmsGatewayService extends ChangeNotifier {
     required int code,
     required String message,
     String mobile = '',
+    bool isIpBlocked = false,
   }) {
     final time = DateTime.now().toIso8601String().substring(11, 19);
     final text = '[REQ $time] $clientIp $method $path mobile=${_maskMobileForLog(mobile)} status=$status code=$code msg=$message';
@@ -1140,10 +1486,16 @@ class SmsGatewayService extends ChangeNotifier {
     } else {
       _stats.failedRequests += 1;
     }
-    if (status == 400) {
+    if (isIpBlocked) {
+      _stats.blockedByIpCount += 1;
+    } else if (status == 400) {
       _stats.badRequestCount += 1;
     } else if (status == 403) {
-      _stats.invalidApiKeyCount += 1;
+      if (message == 'Request denied by IP allowlist') {
+        _stats.blockedByIpCount += 1;
+      } else {
+        _stats.invalidApiKeyCount += 1;
+      }
     } else if (status == 404 || status == 405) {
       _stats.routeOrMethodRejectCount += 1;
     } else if (status == 429) {
@@ -1231,6 +1583,8 @@ class _GatewayStats {
     required this.badRequestCount,
     required this.rateLimitCount,
     required this.routeOrMethodRejectCount,
+    required this.blockedByIpCount,
+    required this.autoRecoverFailures,
     required this.lastRequestTime,
   });
 
@@ -1241,6 +1595,8 @@ class _GatewayStats {
   int badRequestCount;
   int rateLimitCount;
   int routeOrMethodRejectCount;
+  int blockedByIpCount;
+  int autoRecoverFailures;
   String? lastRequestTime;
 
   factory _GatewayStats.empty() => _GatewayStats(
@@ -1251,6 +1607,8 @@ class _GatewayStats {
         badRequestCount: 0,
         rateLimitCount: 0,
         routeOrMethodRejectCount: 0,
+        blockedByIpCount: 0,
+        autoRecoverFailures: 0,
         lastRequestTime: null,
       );
 
@@ -1263,6 +1621,8 @@ class _GatewayStats {
       badRequestCount: badRequestCount,
       rateLimitCount: rateLimitCount,
       routeOrMethodRejectCount: routeOrMethodRejectCount,
+      blockedByIpCount: blockedByIpCount,
+      autoRecoverFailures: autoRecoverFailures,
       lastRequestTime: lastRequestTime,
     );
   }
